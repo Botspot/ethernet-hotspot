@@ -4,13 +4,15 @@
 This is useful for when you only have one WiFi adapter, but you want multiple devices to use that one internet connection, without buying any additional hardware.  
 With this script, I'm using a Raspberry Pi's built-in ethernet port to share its internet connection to other downstream devices.
 
+To connect multiple devices downstream, use an ethernet switch.
+
 ### Preparation
 Install dependencies, clone the repository
 ```
 sudo apt install yad dnsmasq tcpdump
 git clone https://github.com/Botspot/ethernet-hotspot
 ```
-Please note that this script assumes your distro uses NetworkManager (most common ones do)
+Please note that this script assumes your distro uses NetworkManager. (most common ones do)
 
 ### Usage
 1. Run the script.
