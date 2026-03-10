@@ -28,14 +28,14 @@ With this script, I'm using a Raspberry Pi's built-in ethernet port to share its
 Install dependencies, clone the repository
 ```
 sudo apt install yad dnsmasq tcpdump
-git clone https://github.com/Botspot/share-wifi-to-ethernet
+git clone https://github.com/Botspot/ethernet-hotspot
 ```
 Please note that this script assumes your distro uses NetworkManager (most common ones do)
 
 ### Usage
 1. Run the script.
     ```
-    sudo ./share-wifi-to-ethernet/run.sh
+    sudo ./ethernet-hotspot/run.sh
     ```
 2. Choose a network adapter (ethernet or wifi) whose internet connection you'd like to share:  
     <img width="293" height="103" alt="image" src="https://github.com/user-attachments/assets/5a916566-6293-4b21-a22f-a0bf1ada23e2" />
