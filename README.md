@@ -26,3 +26,9 @@ Please note that this script assumes your distro uses NetworkManager. (most comm
 4. Done!
     - Watch the terminal output for errors.
     - Press Ctrl+C in the terminal to stop the script.
+
+This script accepts arguments, for those who want to pre-select the appropriate network adapters every time, are on a headless OS, etc.  
+Simply run `ifconfig` to get an idea of what your network adapters are called, then run the script like this: (change wlan1 and eth0 to suit your setup)
+```
+sudo ./ethernet-hotspot/run.sh wlan1 eth0
+```
