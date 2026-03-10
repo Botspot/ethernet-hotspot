@@ -1,4 +1,4 @@
-### Share your internet connection with other devices, using an ethernet port
+### Share your internet connection with other devices, using an Ethernet cable
 
 ```
 INTERNET
