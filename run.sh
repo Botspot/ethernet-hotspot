@@ -63,8 +63,18 @@ if [ -z "$options" ];then
 else
   options="$(echo "$options" | tr '\n' ' ')"
 fi
-userinput_func "Choose a network interface to share" $options
-UPSTREAM_DEV="$output"
+
+#handle command-line input
+UPSTREAM_DEV="$1"
+if [ ! -z "$UPSTREAM_DEV" ] && echo "$options" | grep -wF "$UPSTREAM_DEV" ;then
+  echo "Using pre-selected upstream network interface: $UPSTREAM_DEV"
+else
+  if [ ! -z "$UPSTREAM_DEV" ];then
+    echo "Warning: Ignoring your pre-selected upstream network interface ($UPSTREAM_DEV) because it does not appear on this list: $options"
+  fi
+  userinput_func "Choose a network interface to share" $options
+  UPSTREAM_DEV="$output"
+fi
 
 options="$(for dev in /sys/class/net/*; do [ -e "$dev/device" ] && [ ! -d "$dev/wireless" ] && echo "${dev##*/}"; done | grep -vFx "$UPSTREAM_DEV")"
 if [ -z "$options" ];then
@@ -72,8 +82,18 @@ if [ -z "$options" ];then
 else
   options="$(echo "$options" | tr '\n' ' ')"
 fi
-userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options
-DOWNSTREAM_DEV="$output"
+
+#handle command-line input
+DOWNSTREAM_DEV="$2"
+if [ ! -z "$DOWNSTREAM_DEV" ] && echo "$options" | grep -wF "$DOWNSTREAM_DEV" ;then
+  echo "Using pre-selected downstream network interface: $DOWNSTREAM_DEV"
+else
+  if [ ! -z "$DOWNSTREAM_DEV" ];then
+    echo "Warning: Ignoring your pre-selected downstream network interface ($DOWNSTREAM_DEV) because it does not appear on this list: $options"
+  fi
+  userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options
+  DOWNSTREAM_DEV="$output"
+fi
 
 echo "upstream $UPSTREAM_DEV"
 echo "downstream $DOWNSTREAM_DEV"
@@ -201,4 +221,4 @@ echo "[!] Awaiting downstream connection. Expected IP allocation: ~$DHCP_START"
 echo "[==================================================]"
 
 # Monitor and output DHCP (UDP 67/68) and ARP traffic in real-time.
-tcpdump -i any "arp or (udp and (port 67 or port 68))" -n || error "Failed to start tcpdump monitoring"
+tcpdump -i any "(udp and (port 67 or port 68))" -n || error "Failed to start tcpdump monitoring"
