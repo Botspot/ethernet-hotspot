@@ -12,7 +12,7 @@
 #    a lightweight `dnsmasq` instance its own clean port 67 to answer downstream requests.
 # 2. We bypass buggy third-party ARP daemons (like `parprouted`) by configuring native
 #    Linux kernel Proxy ARP and routing a tiny sliver of IPs (/28) directly to eth0.
-# 3. We test if the upstream Wi-Fi AP allows spoofed IPs, and automatically apply NAT if it doesn't.
+# 3. We apply NAT (Masquerade) 100% of the time to bypass Wi-Fi Access Point MAC/IP spoofing protections.
 
 # --- Error Handling ---
 # Prints red text and exits immediately if a critical command fails.
@@ -166,40 +166,14 @@ SUBNET=$(echo $UPSTREAM_DEV_IP | cut -d. -f1-3)
 ROUTER_IP=$(ip route show default | awk '/default/ {print $3}' | head -n 1)
 
 # Define a /28 subnet at the very top of the range (covers .240 to .255).
+# This avoids DHCP pool collisions with the main upstream router.
 DHCP_SUBNET="${SUBNET}.240/28"
 DHCP_START="${SUBNET}.241"
 DHCP_END="${SUBNET}.249"
-DHCP_NS_IP="${SUBNET}.250" 
+DHCP_NS_IP="${SUBNET}.250" # The IP the namespace DHCP server will use to communicate.
 
 echo "[+] Main Router Gateway detected: $ROUTER_IP"
 echo "[+] Reserving isolated DHCP pool for downstream: $DHCP_START - $DHCP_END"
-
-
-# --- AP Strictness Auto-Detection ---
-echo "[+] Testing if Wi-Fi Access Point enforces strict Layer-2 MAC/IP matching..."
-# We must run this test ON the upstream Wi-Fi interface BEFORE injecting downstream static routes, 
-# otherwise Linux's internal routing table or rp_filter will kill the test packet locally, causing a false positive.
-ip addr add $DHCP_END/32 dev $UPSTREAM_DEV
-
-# Attempt to ping the router using the spoofed downstream IP. We capture output for debugging.
-if PING_OUT=$(ping -I $DHCP_END -c 2 -W 2 $ROUTER_IP 2>&1); then
-    echo "[+] SUCCESS: Permissive Wi-Fi AP detected. Bypassing NAT for direct downstream access!"
-    USE_NAT=0
-else
-    echo "[!] WARNING: Spoof test failed. The Wi-Fi AP likely dropped the packet."
-    echo "[!] DEBUG OUTPUT: $PING_OUT"
-    echo "[!] Applying NAT (Masquerade) rule as a fallback."
-    USE_NAT=1
-fi
-
-# Clean up the temporary test IP
-ip addr del $DHCP_END/32 dev $UPSTREAM_DEV
-
-# Apply NAT if the test failed
-if [ "$USE_NAT" -eq 1 ]; then
-    iptables -t nat -A POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE || error "Failed to apply iptables NAT masquerade rule"
-fi
-
 
 # --- Host Routing & Proxy ARP Configuration ---
 echo "[+] Enabling IP forwarding and Proxy ARP..."
@@ -218,6 +192,8 @@ ip route add $DHCP_SUBNET dev $DOWNSTREAM_DEV || error "Failed to add static rou
 echo "[+] Creating isolated network namespace 'dhcp_ns'..."
 ip netns add dhcp_ns || error "Failed to create network namespace"
 
+# Create a macvlan bridge. This creates a virtual network interface that shares the
+# physical eth0 hardware but operates independently, allowing us to drop it into the namespace.
 echo "[+] Spinning up macvlan interface on $DOWNSTREAM_DEV and binding to namespace..."
 ip link add link $DOWNSTREAM_DEV name eth0_dhcp type macvlan mode bridge || error "Failed to create macvlan interface"
 ip link set eth0_dhcp netns dhcp_ns || error "Failed to move macvlan to namespace"
@@ -227,6 +203,12 @@ ip netns exec dhcp_ns ip link set lo up || error "Failed to bring up loopback in
 ip netns exec dhcp_ns ip link set eth0_dhcp up || error "Failed to bring up macvlan in namespace"
 ip netns exec dhcp_ns ip addr add ${DHCP_NS_IP}/24 dev eth0_dhcp || error "Failed to assign IP to macvlan"
 
+# --- Apply NAT (Masquerade) ---
+echo "[+] Applying NAT (Masquerade) to bypass Wi-Fi AP Layer-2 restrictions..."
+iptables -t nat -A POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE || error "Failed to apply iptables NAT masquerade rule"
+
+# Launch dnsmasq entirely inside the isolated namespace.
+# Because it's isolated, it will successfully bind to port 67 on eth0_dhcp without hitting the Waydroid lock.
 echo "[+] Launching isolated dnsmasq DHCP server..."
 ip netns exec dhcp_ns /usr/sbin/dnsmasq \
   --conf-file=/dev/null \
