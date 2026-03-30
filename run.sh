@@ -133,7 +133,11 @@ cleanup() {
   # 5. Hand control back to NetworkManager so it can resume normal operations.
   echo "[+] Returning $DOWNSTREAM_DEV to NetworkManager control..."
   nmcli device set $DOWNSTREAM_DEV managed yes
-
+  
+  # 6. Bring physical link back up so NetworkManager can use it normally
+  echo "[+] Bringing $DOWNSTREAM_DEV back up..."
+  ip link set $DOWNSTREAM_DEV up
+  
   echo "[✓] Teardown complete. System restored to normal."
   exit 0
 }
