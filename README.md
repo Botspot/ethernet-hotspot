@@ -1,4 +1,6 @@
 # Ethernet Hotspot <a href="https://github.com/Botspot/pi-apps"><img src="https://github.com/Botspot/pi-apps/blob/master/icons/badge.png?raw=true" align="right"></a>
+<img width="256" height="256" alt="wifi-hotspot" src="https://github.com/user-attachments/assets/2de069b1-cafc-4e60-bf3b-7d787d0a296a" />
+
 
 ### Share your internet connection with other devices, using an Ethernet cable
 <img width="2543" height="1083" alt="eth-hotspot-diagram" src="https://github.com/user-attachments/assets/5cfd1836-6cd1-4d85-8f89-b5c4e092dfde" />
