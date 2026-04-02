@@ -56,7 +56,7 @@ update_check() { #check for updates and reload the script if necessary
     
     if [ $? == 0 ];then
       echo "git pull finished. Reloading script..."
-      "$DIRECTORY/bvm" "${original_flags[@]}"
+      "$DIRECTORY/run.sh" "${original_flags[@]}"
       exit $?
     else
       warning "update_check: git pull failed. Continuing..."
