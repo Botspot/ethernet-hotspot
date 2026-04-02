@@ -1,43 +1,73 @@
 #!/bin/bash
-# Usage: sudo ./eth-to-wlan.sh
+# Usage: sudo ./eth-to-wlan.sh [upstream_wlan_or_usb] [downstream_eth]
 # Press Ctrl+C to stop and revert all changes.
-#
-# DESIGN SUMMARY:
-# This script bridges an upstream Wi-Fi connection to a downstream Ethernet port.
-# Because a host process (like Waydroid) irrevocably locks port 67 (DHCP) across 0.0.0.0,
-# standard DHCP relays or local dnsmasq servers will fail to bind.
-#
-# SOLUTION:
-# 1. We create an isolated Network Namespace and use a `macvlan` interface to give
-#    a lightweight `dnsmasq` instance its own clean port 67 to answer downstream requests.
-# 2. We bypass buggy third-party ARP daemons (like `parprouted`) by configuring native
-#    Linux kernel Proxy ARP and routing a tiny sliver of IPs (/28) directly to eth0.
-# 3. We apply NAT (Masquerade) 100% of the time to bypass Wi-Fi Access Point MAC/IP spoofing protections.
 
-# --- Error Handling ---
-# Prints red text and exits immediately if a critical command fails.
+# DESIGN SUMMARY:
+# This script shares an upstream connection (Wi-Fi or USB tethering) to a downstream Ethernet port.
+#
+# SOLUTION MECHANICS:
+# 1. DHCP ISOLATION: Because host processes (like Waydroid, Docker, or libvirt) often irrevocably
+#    lock port 67 (DHCP) on 0.0.0.0, standard local dnsmasq servers fail to bind. We solve this by
+#    creating an isolated Network Namespace. A `macvlan` interface links this namespace to the
+#    downstream adapter, giving `dnsmasq` a clean, dedicated environment to answer DHCP requests.
+# 2. POLICY-BASED ROUTING (PBR): Instead of relying on buggy Proxy ARP daemons or bridging, the
+#    script provisions a dynamic, dedicated /24 subnet (10.42.X.0/24). It uses PBR with custom
+#    routing tables to forcefully route downstream traffic out the selected upstream gateway,
+#    preventing multi-WAN conflicts with the host's default routing table.
+# 3. NAT/MASQUERADE: Outbound traffic is MASQUERADED using `nftables` (with iptables fallback).
+#    This is strictly required to bypass Wi-Fi Access Point MAC/IP spoofing protections, as APs
+#    will drop frames containing the MAC addresses of downstream devices.
+# 4. SERVICE DISCOVERY: Dynamically tweaks `avahi-daemon` to enable mDNS reflection across
+#    subnets, allowing downstream devices to discover cast targets, TVs, or printers upstream.
+
+# Determine GUI availability exactly once
+USE_GUI=0
+if { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; } && command -v yad >/dev/null 2>&1; then
+  USE_GUI=1
+fi
+
 error() {
   echo -e "\e[91m[-] FATAL ERROR: $1\e[0m" 1>&2
+  if [ "$USE_GUI" -eq 1 ]; then
+    yad --title="Fatal Error" --window-icon=dialog-error --image=dialog-error \
+        --text="$1" --button="Close:0" --center --borders=20 --fixed 2>/dev/null
+  fi
   exit 1
 }
 
-userinput_func() { # userinput function to display yad/cli prompts to the user
+warning() { #yellow text
+  echo -e "\e[93m\e[5m◢◣\e[25m WARNING: $1\e[0m" 1>&2
+}
+
+userinput_func() {
   local text="$1"
   [ -z "$text" ] && error "userinput_func(): requires a description"
   shift
   [ -z "$1" ] && error "userinput_func(): requires at least one output selection option"
-  local text_lines=$(echo -e "$1" | wc -l)
   
+  # Fallback to CLI (read/select) if no GUI is available
+  if [ "$USE_GUI" -eq 0 ]; then
+    echo -e "\n=== $text ==="
+    local PS3="Please enter the number of your choice: "
+    select opt in "$@"; do
+      if [ -n "$opt" ]; then
+        output="$opt"
+        return 0
+      else
+        echo "Invalid selection. Please try again."
+      fi
+    done
+    return 1
+  fi
+  
+  # GUI Logic
   local uniq_selection=()
   local string string_echo
-  #make a form button for each choice
   for string in "$@"; do
-    #to address bash subprocess syntax errors, while making output match input, escape any double-quotes in the string down 3 layers
     string_echo="$(echo "$string" | sed 's/"/"\\"""\\\\""\\"""\\"/g')"
     uniq_selection+=(--field="$string:FBTN" "bash -c "\""echo "\"""\\""\"""\""$string_echo"\"""\\""\"""\"";kill "\$"YAD_PID"\""")
   done
 
-  #make long lists of options scrollable, with a sensible window size
   if [ "${#@}" -gt 10 ];then
     uniq_selection+=(--scroll --width=600 --height=400)
   fi
@@ -58,176 +88,222 @@ userinput_func() { # userinput function to display yad/cli prompts to the user
 
 if [ "$EUID" -ne 0 ]; then
   error "Script must be run as root (use sudo)"
-elif ! command -v yad >/dev/null || ! command -v dnsmasq >/dev/null || ! command -v tcpdump >/dev/null || ! command -v iptables >/dev/null ;then
-  error "Please install the dependencies: yad dnsmasq tcpdump iptables"
+elif ! command -v dnsmasq >/dev/null || ! command -v tcpdump >/dev/null || ! command -v nft >/dev/null ;then
+  error "Please install the dependencies: dnsmasq tcpdump nftables\n(Optional: 'yad' for GUI prompts)"
 fi
 
-#Choose a network interface to share
-options="$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u)"
-if [ -z "$options" ];then
-  error "Could not find any default network device that the kernel considers 'default'!"
-else
-  options="$(echo "$options" | tr '\n' ' ')"
+# 1. Grab ONLY wireless or USB interfaces that are actively connected (have an IPv4 address)
+options="$(for dev in /sys/class/net/*; do
+  ifname="${dev##*/}"
+  # Include wireless adapters, interfaces starting with 'usb', or adapters on a physical USB bus
+  if [ -d "$dev/wireless" ] || [[ "$ifname" == usb* ]] || { [ -e "$dev/device" ] && readlink -f "$dev/device" | grep -q "usb"; }; then
+    if ip -4 addr show dev "$ifname" 2>/dev/null | grep -q "inet "; then
+      echo "$ifname"
+    fi
+  fi
+done | tr '\n' ' ')"
+
+if [ -z "$options" ]; then
+  error "Could not find any actively connected Wi-Fi or USB adapters. Please connect to a network first!"
 fi
 
-#handle command-line input
 UPSTREAM_DEV="$1"
-if [ ! -z "$UPSTREAM_DEV" ] && echo "$options" | grep -wF "$UPSTREAM_DEV" ;then
+if [ ! -z "$UPSTREAM_DEV" ] && echo "$options" | grep -wF "$UPSTREAM_DEV" >/dev/null ;then
   echo "Using pre-selected upstream network interface: $UPSTREAM_DEV"
 else
-  if [ ! -z "$UPSTREAM_DEV" ];then
-    echo "Warning: Ignoring your pre-selected upstream network interface ($UPSTREAM_DEV) because it does not appear on this list: $options"
-  fi
-  userinput_func "Choose a network interface to share" $options || error "Failed to launch GUI to select upstream network interface!\nYour options are: '$options'\nPlease specity one as the first argument to this script."
+  [ ! -z "$UPSTREAM_DEV" ] && warning "Ignoring pre-selected upstream interface ($UPSTREAM_DEV)."
+  userinput_func "Choose an active Wi-Fi/USB interface to share" $options || error "Failed to get user input.\nPlease specify interface as first argument."
   UPSTREAM_DEV="$output"
 fi
 
-options="$(for dev in /sys/class/net/*; do [ -e "$dev/device" ] && [ ! -d "$dev/wireless" ] && echo "${dev##*/}"; done | grep -vFx "$UPSTREAM_DEV")"
+# 2. Grab Ethernet interfaces (Excludes the selected upstream interface)
+options="$(for dev in /sys/class/net/*; do [ -e "$dev/device" ] && [ ! -d "$dev/wireless" ] && echo "${dev##*/}"; done | grep -vFx "$UPSTREAM_DEV" | tr '\n' ' ')"
 if [ -z "$options" ];then
   error "Could not find any ethernet network devices to share a connection to!"
-else
-  options="$(echo "$options" | tr '\n' ' ')"
 fi
 
-#handle command-line input
 DOWNSTREAM_DEV="$2"
-if [ ! -z "$DOWNSTREAM_DEV" ] && echo "$options" | grep -wF "$DOWNSTREAM_DEV" ;then
+if [ ! -z "$DOWNSTREAM_DEV" ] && echo "$options" | grep -wF "$DOWNSTREAM_DEV" >/dev/null ;then
   echo "Using pre-selected downstream network interface: $DOWNSTREAM_DEV"
 else
-  if [ ! -z "$DOWNSTREAM_DEV" ];then
-    echo "Warning: Ignoring your pre-selected downstream network interface ($DOWNSTREAM_DEV) because it does not appear on this list: $options"
-  fi
-  userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options || error "Failed to launch GUI to select downstream network interface!\nYour options are: '$options'\nPlease specity one as the second argument to this script."
+  [ ! -z "$DOWNSTREAM_DEV" ] && warning "Ignoring pre-selected downstream interface ($DOWNSTREAM_DEV)."
+  userinput_func "Choose an Ethernet adapter to connect to downstream device(s)" $options || error "Failed to get user input.\nPlease specify interface as second argument."
   DOWNSTREAM_DEV="$output"
 fi
 
-echo "upstream $UPSTREAM_DEV"
-echo "downstream $DOWNSTREAM_DEV"
+# 3. Dynamic Subnet & Instance Calculator
+SUBNET_X=0
+while [ $SUBNET_X -lt 255 ]; do
+  if ! ip route show | grep -q "^10.42.$SUBNET_X.0/24"; then
+    break
+  fi
+  SUBNET_X=$((SUBNET_X + 1))
+done
+if [ $SUBNET_X -eq 255 ]; then
+  error "Could not find a free 10.42.X.0/24 subnet to host this connection."
+fi
+
+SUBNET_PREFIX="10.42.$SUBNET_X"
+HOST_IP="$SUBNET_PREFIX.1"
+DHCP_NS_IP="$SUBNET_PREFIX.2"
+DHCP_START="$SUBNET_PREFIX.10"
+DHCP_END="$SUBNET_PREFIX.100"
+
+# Unique Instance Variables
+TABLE_ID=$((100 + SUBNET_X))
+NS_NAME="dhcp_ns_$SUBNET_X"
+MACVLAN_NAME="macv_$SUBNET_X"
+PID_FILE="/var/run/ns_dnsmasq_$SUBNET_X.pid"
+AVAHI_BAK="/etc/avahi/avahi-daemon.conf.bak.pseudobridge_$SUBNET_X"
+NAT_TABLE="pseudobridge_nat_$SUBNET_X"
+FILTER_TABLE="pseudobridge_filter_$SUBNET_X"
+
+# 4. Gateway Discovery for Policy-Based Routing
+UPSTREAM_GW=$(ip -4 route show dev $UPSTREAM_DEV | awk '/default/ {print $3}' | head -n 1)
+if [ -z "$UPSTREAM_GW" ]; then
+  error "$UPSTREAM_DEV does not have a default gateway configured. Ensure it has internet access."
+fi
+UPSTREAM_SUBNET=$(ip -4 route show dev $UPSTREAM_DEV scope link | awk '{print $1}' | head -n 1)
 
 cleanup() {
-  echo -e "\n\n[!] Ctrl+C detected. Initiating teardown sequence..."
+  trap - INT TERM EXIT
+  echo -e "\n\n[!] Teardown sequence initiated for instance $SUBNET_X ($UPSTREAM_DEV -> $DOWNSTREAM_DEV)..."
   
-  # 1. Terminate isolated dnsmasq and monitoring tools.
-  if [ -f /var/run/ns_dnsmasq.pid ]; then
-    kill $(cat /var/run/ns_dnsmasq.pid) 2>/dev/null
-    rm -f /var/run/ns_dnsmasq.pid
+  if [ -f "$PID_FILE" ]; then
+    kill $(cat "$PID_FILE") 2>/dev/null
+    rm -f "$PID_FILE"
   fi
 
-  # 2. Obliterate the namespace. This automatically cleans up the macvlan interface inside it.
-  echo "[+] Removing network namespace 'dhcp_ns'..."
-  ip netns del dhcp_ns 2>/dev/null
+  ip netns del $NS_NAME 2>/dev/null
+  nft delete table ip $NAT_TABLE 2>/dev/null
+  nft delete table ip $FILTER_TABLE 2>/dev/null
+  
+  iptables -D FORWARD -i "$DOWNSTREAM_DEV" -j ACCEPT 2>/dev/null
+  iptables -D FORWARD -o "$DOWNSTREAM_DEV" -j ACCEPT 2>/dev/null
+  iptables -D INPUT -i "$DOWNSTREAM_DEV" -j ACCEPT 2>/dev/null
 
-  # 3. Revert NAT and kernel routing flags to prevent unwanted network leakage later.
-  echo "[+] Reverting IP routing, NAT rules, and proxy ARP kernel flags..."
-  iptables -t nat -D POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE 2>/dev/null
-  sysctl -w net.ipv4.ip_forward=0 > /dev/null
-  sysctl -w net.ipv4.conf.all.proxy_arp=0 > /dev/null
-  sysctl -w net.ipv4.conf.$UPSTREAM_DEV.proxy_arp=0 > /dev/null
-  sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.proxy_arp=0 > /dev/null
+  # Remove Policy-Based Routing Rules
+  ip rule del from $HOST_IP/24 table $TABLE_ID 2>/dev/null
+  ip route flush table $TABLE_ID 2>/dev/null
 
-  # 4. Wipe our manual IPs and drop the physical link.
-  echo "[+] Flushing and bringing down $DOWNSTREAM_DEV..."
+  if [ -f "$AVAHI_BAK" ]; then
+    mv "$AVAHI_BAK" /etc/avahi/avahi-daemon.conf
+    systemctl restart avahi-daemon 2>/dev/null
+  fi
+
   ip addr flush dev $DOWNSTREAM_DEV 2>/dev/null
   ip link set $DOWNSTREAM_DEV down
 
-  # 5. Hand control back to NetworkManager so it can resume normal operations.
-  echo "[+] Returning $DOWNSTREAM_DEV to NetworkManager control..."
-  nmcli device set $DOWNSTREAM_DEV managed yes
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli device set $DOWNSTREAM_DEV managed yes
+  fi
   
-  # 6. Bring physical link back up so NetworkManager can use it normally
-  echo "[+] Bringing $DOWNSTREAM_DEV back up..."
   ip link set $DOWNSTREAM_DEV up
-  
-  echo "[✓] Teardown complete. System restored to normal."
+  echo "[✓] Teardown complete for instance $SUBNET_X."
   exit 0
 }
 
-# Trap standard exit signals to guarantee cleanup runs even if the script is interrupted.
 trap cleanup INT TERM EXIT
 
-echo "[+] Starting Wi-Fi to Ethernet Pseudobridge with Isolated DHCP..."
+echo "[+] Starting Multi-WAN Pseudobridge ($UPSTREAM_DEV -> $DOWNSTREAM_DEV)..."
 
-# Pre-cleanup in case a previous run crashed or was forcefully killed (SIGKILL).
-ip netns del dhcp_ns 2>/dev/null
-iptables -t nat -D POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE 2>/dev/null
+# Pre-cleanup instance variables
+ip netns del $NS_NAME 2>/dev/null
+nft delete table ip $NAT_TABLE 2>/dev/null
+nft delete table ip $FILTER_TABLE 2>/dev/null
+ip rule del from $HOST_IP/24 table $TABLE_ID 2>/dev/null
 
-# Disconnect NetworkManager from eth0. If we don't do this, NM will detect the link
-# state change when a device is plugged in, wipe our manual IPs, and try to request its own.
-echo "[+] Setting $DOWNSTREAM_DEV to unmanaged state in NetworkManager..."
-nmcli device set $DOWNSTREAM_DEV managed no || error "Failed to release $DOWNSTREAM_DEV from NetworkManager"
+if command -v nmcli >/dev/null 2>&1; then
+  nmcli device set $DOWNSTREAM_DEV managed no || error "Failed to release $DOWNSTREAM_DEV from NM"
+  sleep 1
+fi
 
-echo "[+] Bringing up $DOWNSTREAM_DEV physical link..."
 ip link set $DOWNSTREAM_DEV up || error "Failed to bring up $DOWNSTREAM_DEV"
 ip addr flush dev $DOWNSTREAM_DEV || error "Failed to flush $DOWNSTREAM_DEV addresses"
+ip addr add $HOST_IP/24 dev $DOWNSTREAM_DEV || error "Failed to assign subnet IP"
 
-# --- Dynamic Subnet & Pool Calculation ---
-UPSTREAM_DEV_CIDR=$(ip -4 addr show $UPSTREAM_DEV | awk '/inet / {print $2}' | head -n 1)
-if [ -z "$UPSTREAM_DEV_CIDR" ]; then
-    error "Could not find an IPv4 address for $UPSTREAM_DEV. Ensure you are connected to Wi-Fi."
-fi
-UPSTREAM_DEV_IP=$(echo $UPSTREAM_DEV_CIDR | cut -d/ -f1)
-SUBNET=$(echo $UPSTREAM_DEV_IP | cut -d. -f1-3)
-ROUTER_IP=$(ip route show default | awk '/default/ {print $3}' | head -n 1)
+echo "[+] Enabling IP forwarding..."
+sysctl -w net.ipv4.ip_forward=1 > /dev/null || error "Failed to enable global ip_forward"
+sysctl -w net.ipv4.conf.$UPSTREAM_DEV.forwarding=1 > /dev/null
+sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.forwarding=1 > /dev/null
 
-# Define a /28 subnet at the very top of the range (covers .240 to .255).
-# This avoids DHCP pool collisions with the main upstream router.
-DHCP_SUBNET="${SUBNET}.240/28"
-DHCP_START="${SUBNET}.241"
-DHCP_END="${SUBNET}.249"
-DHCP_NS_IP="${SUBNET}.250" # The IP the namespace DHCP server will use to communicate.
+echo "[+] Creating isolated network namespace '$NS_NAME'..."
+ip netns add $NS_NAME || error "Failed to create network namespace"
+ip link add link $DOWNSTREAM_DEV name $MACVLAN_NAME type macvlan mode bridge || error "Failed to create macvlan"
+ip link set $MACVLAN_NAME netns $NS_NAME || error "Failed to move macvlan to namespace"
 
-echo "[+] Main Router Gateway detected: $ROUTER_IP"
-echo "[+] Reserving isolated DHCP pool for downstream: $DHCP_START - $DHCP_END"
+ip netns exec $NS_NAME ip link set lo up
+ip netns exec $NS_NAME ip link set $MACVLAN_NAME up
+ip netns exec $NS_NAME ip addr add ${DHCP_NS_IP}/24 dev $MACVLAN_NAME
 
-# --- Host Routing & Proxy ARP Configuration ---
-echo "[+] Enabling IP forwarding and Proxy ARP..."
-sysctl -w net.ipv4.ip_forward=1 > /dev/null || error "Failed to enable ip_forward"
-sysctl -w net.ipv4.conf.all.proxy_arp=1 > /dev/null || error "Failed to set global proxy_arp"
-sysctl -w net.ipv4.conf.$UPSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $UPSTREAM_DEV proxy_arp"
-sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.proxy_arp=1 > /dev/null || error "Failed to set $DOWNSTREAM_DEV proxy_arp"
+echo "[+] Implementing Policy-Based Routing (Table $TABLE_ID)..."
+echo "    -> Upstream Gateway: $UPSTREAM_GW"
+ip rule add from $HOST_IP/24 table $TABLE_ID prio 1000
+ip route add $UPSTREAM_SUBNET dev $UPSTREAM_DEV scope link table $TABLE_ID
+ip route add $SUBNET_PREFIX.0/24 dev $DOWNSTREAM_DEV scope link table $TABLE_ID
+ip route add default via $UPSTREAM_GW dev $UPSTREAM_DEV table $TABLE_ID
 
-echo "[+] Cloning Wi-Fi IP ($UPSTREAM_DEV_IP) to $DOWNSTREAM_DEV to satisfy kernel routing..."
-ip addr add $UPSTREAM_DEV_IP/32 dev $DOWNSTREAM_DEV || error "Failed to clone IP to $DOWNSTREAM_DEV"
+echo "[+] Applying Instance Firewall & NAT rules..."
+nft add table ip $NAT_TABLE || error "Failed to create nat table"
+nft add chain ip $NAT_TABLE postrouting { type nat hook postrouting priority 100 \; }
+nft add rule ip $NAT_TABLE postrouting oifname "$UPSTREAM_DEV" masquerade || error "Failed to apply masquerade"
 
-echo "[+] Injecting static route for downstream pool ($DHCP_SUBNET) to $DOWNSTREAM_DEV..."
-ip route add $DHCP_SUBNET dev $DOWNSTREAM_DEV || error "Failed to add static route for downstream pool"
+nft add table ip $FILTER_TABLE || error "Failed to create filter table"
+# Allow Internet Forwarding
+nft add chain ip $FILTER_TABLE forward { type filter hook forward priority 0 \; }
+nft add rule ip $FILTER_TABLE forward iifname "$DOWNSTREAM_DEV" oifname "$UPSTREAM_DEV" accept || error "Failed to allow forward"
+nft add rule ip $FILTER_TABLE forward iifname "$UPSTREAM_DEV" oifname "$DOWNSTREAM_DEV" accept || error "Failed to allow forward"
+# Allow Local Host Input (for RustDesk/SSH)
+nft add chain ip $FILTER_TABLE input { type filter hook input priority 0 \; }
+nft add rule ip $FILTER_TABLE input iifname "$DOWNSTREAM_DEV" accept
 
-# --- Namespace & MACVLAN Isolation Setup ---
-echo "[+] Creating isolated network namespace 'dhcp_ns'..."
-ip netns add dhcp_ns || error "Failed to create network namespace"
+# Fallback Legacy iptables
+iptables -I FORWARD -i "$DOWNSTREAM_DEV" -j ACCEPT
+iptables -I FORWARD -o "$DOWNSTREAM_DEV" -j ACCEPT
+iptables -I INPUT -i "$DOWNSTREAM_DEV" -j ACCEPT
 
-# Create a macvlan bridge. This creates a virtual network interface that shares the
-# physical eth0 hardware but operates independently, allowing us to drop it into the namespace.
-echo "[+] Spinning up macvlan interface on $DOWNSTREAM_DEV and binding to namespace..."
-ip link add link $DOWNSTREAM_DEV name eth0_dhcp type macvlan mode bridge || error "Failed to create macvlan interface"
-ip link set eth0_dhcp netns dhcp_ns || error "Failed to move macvlan to namespace"
+UPSTREAM_DNS=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep -v '^127\.' | head -n 1)
+[ -z "$UPSTREAM_DNS" ] && UPSTREAM_DNS="8.8.8.8"
 
-echo "[+] Initializing namespace networking stack..."
-ip netns exec dhcp_ns ip link set lo up || error "Failed to bring up loopback in namespace"
-ip netns exec dhcp_ns ip link set eth0_dhcp up || error "Failed to bring up macvlan in namespace"
-ip netns exec dhcp_ns ip addr add ${DHCP_NS_IP}/24 dev eth0_dhcp || error "Failed to assign IP to macvlan"
-
-# --- Apply NAT (Masquerade) ---
-echo "[+] Applying NAT (Masquerade) to bypass Wi-Fi AP Layer-2 restrictions..."
-iptables -t nat -A POSTROUTING -o $UPSTREAM_DEV -j MASQUERADE || error "Failed to apply iptables NAT masquerade rule"
-
-# Launch dnsmasq entirely inside the isolated namespace.
-# Because it's isolated, it will successfully bind to port 67 on eth0_dhcp without hitting the Waydroid lock.
 echo "[+] Launching isolated dnsmasq DHCP server..."
-ip netns exec dhcp_ns /usr/sbin/dnsmasq \
+ip netns exec $NS_NAME /usr/sbin/dnsmasq \
   --conf-file=/dev/null \
   --bind-interfaces \
-  --interface=eth0_dhcp \
+  --interface=$MACVLAN_NAME \
   --except-interface=lo \
   --dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,12h \
-  --dhcp-option=3,${ROUTER_IP} \
-  --dhcp-option=6,8.8.8.8 \
-  --pid-file=/var/run/ns_dnsmasq.pid || error "Failed to start dnsmasq in namespace"
+  --dhcp-option=3,${HOST_IP} \
+  --dhcp-option=6,${UPSTREAM_DNS} \
+  --pid-file="$PID_FILE" || error "Failed to start dnsmasq in namespace"
 
-echo "[==================================================]"
-echo "[✓] Wi-Fi Pseudobridge is ACTIVE. Press Ctrl+C to safely teardown."
-echo "[!] Awaiting downstream connection. Expected IP allocation: ~$DHCP_START"
+if command -v avahi-daemon >/dev/null && systemctl is-active --quiet avahi-daemon; then
+  echo "[+] Enabling Avahi mDNS reflection for instance..."
+  cp /etc/avahi/avahi-daemon.conf "$AVAHI_BAK"
+  sed -i 's/.*enable-reflector.*/enable-reflector=yes/' /etc/avahi/avahi-daemon.conf
+  grep -q "enable-reflector=yes" /etc/avahi/avahi-daemon.conf || sed -i '/^\[server\]/a enable-reflector=yes' /etc/avahi/avahi-daemon.conf
+  systemctl restart avahi-daemon
+fi
+
+echo -e "\n[========== SYSTEM DIAGNOSTICS ==========]"
+RP_UPSTREAM=$(cat /proc/sys/net/ipv4/conf/$UPSTREAM_DEV/rp_filter)
+RP_ETH=$(cat /proc/sys/net/ipv4/conf/$DOWNSTREAM_DEV/rp_filter)
+if [ "$RP_UPSTREAM" -eq 1 ] || [ "$RP_ETH" -eq 1 ]; then
+  echo "[-] Relaxing Strict Reverse Path Filtering..."
+  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
+  sysctl -w net.ipv4.conf.$UPSTREAM_DEV.rp_filter=2 >/dev/null
+  sysctl -w net.ipv4.conf.$DOWNSTREAM_DEV.rp_filter=2 >/dev/null
+else
+  echo "[✓] Reverse Path Filtering looks safe."
+fi
+
+IPTABLES_POL=$(iptables -L FORWARD -n | head -n 1)
+if echo "$IPTABLES_POL" | grep -q "DROP"; then
+  warning "Legacy iptables is defaulting to DROP. Fallback rules applied."
+fi
+echo "[========================================]"
+
+echo "[✓] PBR Pseudobridge is ACTIVE: $DOWNSTREAM_DEV -> $UPSTREAM_DEV"
+echo "[!] DHCP Subnet: $SUBNET_PREFIX.x (Gateway: $HOST_IP)"
 echo "[==================================================]"
 
-# Monitor and output DHCP (UDP 67/68) and ARP traffic in real-time.
-tcpdump -i any "(udp and (port 67 or port 68)) or arp" -n || error "Failed to start tcpdump monitoring"
+tcpdump -i any "icmp or (udp and (port 67 or port 68))" -n || error "Failed to start tcpdump monitoring"
