@@ -26,6 +26,11 @@ if { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; } && command -v yad >/dev/n
   USE_GUI=1
 fi
 
+DIRECTORY="$(readlink -f "$(dirname "$0")")"
+
+#Track the original arguments given to the script in order to restart in an update
+original_flags=("$@")
+
 error() {
   echo -e "\e[91m[-] FATAL ERROR: $1\e[0m" 1>&2
   if [ "$USE_GUI" -eq 1 ]; then
@@ -37,6 +42,26 @@ error() {
 
 warning() { #yellow text
   echo -e "\e[93m\e[5m◢◣\e[25m WARNING: $1\e[0m" 1>&2
+}
+
+update_check() { #check for updates and reload the script if necessary
+  localhash="$(cd "$DIRECTORY" ; git rev-parse HEAD)"
+  latesthash="$(git ls-remote https://github.com/Botspot/ethernet-hotspot HEAD | awk '{print $1}')"
+  if [ "$localhash" != "$latesthash" ] && [ ! -z "$latesthash" ] && [ ! -z "$localhash" ];then
+    echo "Auto-updating this script for the latest features and improvements..."
+    (cd "$DIRECTORY"
+    git restore . #abandon changes to tracked files (otherwise users who modified this script are left behind)
+    git -c color.ui=always pull | cat #piping through cat makes git noninteractive
+    exit "${PIPESTATUS[0]}")
+    
+    if [ $? == 0 ];then
+      echo "git pull finished. Reloading script..."
+      "$DIRECTORY/bvm" "${original_flags[@]}"
+      exit $?
+    else
+      warning "update_check: git pull failed. Continuing..."
+    fi
+  fi
 }
 
 userinput_func() {
@@ -85,6 +110,8 @@ userinput_func() {
     return 0
   fi
 }
+
+update_check
 
 if [ "$EUID" -ne 0 ]; then
   error "Script must be run as root (use sudo)"
