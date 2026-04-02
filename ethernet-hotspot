@@ -26,7 +26,9 @@ if { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; } && command -v yad >/dev/n
   USE_GUI=1
 fi
 
-DIRECTORY="$(readlink -f "$(dirname "$0")")"
+DIRECTORY="$(dirname "$(readlink -f "$0")")"
+echo "DIRECTORY is $DIRECTORY"
+exit 0
 
 #Track the original arguments given to the script in order to restart in an update
 original_flags=("$@")
