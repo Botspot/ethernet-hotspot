@@ -9,7 +9,7 @@ To connect multiple devices downstream, use an ethernet switch.
 ### Preparation
 Install dependencies, clone the repository
 ```
-sudo apt install yad dnsmasq tcpdump iptables
+sudo apt install dnsmasq tcpdump nftables yad
 git clone https://github.com/Botspot/ethernet-hotspot
 ```
 Please note that this script assumes your distro uses NetworkManager. (most common ones do)
