@@ -31,10 +31,12 @@ DIRECTORY="$(readlink -f "$(dirname "$0")")"
 #Track the original arguments given to the script in order to restart in an update
 original_flags=("$@")
 
+yadflags=(--title="Ethernet Hotspot" --separator='\n' --class ethernet-hotspot --name ethernet-hotspot)
+
 error() {
   echo -e "\e[91m[-] FATAL ERROR: $1\e[0m" 1>&2
   if [ "$USE_GUI" -eq 1 ]; then
-    yad --title="Fatal Error" --window-icon=dialog-error --image=dialog-error \
+    yad "${yadflags[@]}" --title="Fatal Error" --window-icon=dialog-error --image=dialog-error \
         --text="$1" --button="Close:0" --center --borders=20 --fixed 2>/dev/null
   fi
   exit 1
@@ -95,10 +97,6 @@ userinput_func() {
 
   if [ "${#@}" -gt 10 ];then
     uniq_selection+=(--scroll --width=600 --height=400)
-  fi
-  
-  if [ -z "${yadflags[*]}" ];then
-    yadflags=(--title="Network interface sharing" --separator='\n')
   fi
   
   output=$(yad "${yadflags[@]}" --no-escape --undecorated --center --borders=20 \
