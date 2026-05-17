@@ -194,6 +194,10 @@ cleanup() {
   trap - INT TERM EXIT
   echo -e "\n\n[!] Teardown sequence initiated for instance $SUBNET_X ($UPSTREAM_DEV -> $DOWNSTREAM_DEV)..."
   
+  if [ -n "$DAEMON_PID" ]; then
+    kill $DAEMON_PID 2>/dev/null
+  fi
+  
   if [ -f "$PID_FILE" ]; then
     kill $(cat "$PID_FILE") 2>/dev/null
     rm -f "$PID_FILE"
@@ -330,5 +334,32 @@ echo "[========================================]"
 echo "[✓] PBR Pseudobridge is ACTIVE: $DOWNSTREAM_DEV -> $UPSTREAM_DEV"
 echo "[!] DHCP Subnet: $SUBNET_PREFIX.x (Gateway: $HOST_IP)"
 echo "[==================================================]"
+
+# 5. Self-Healing Daemon (Link Flap Recovery)
+(
+  while true; do
+    sleep 10
+    # Check if the kernel wiped the default internet route from our custom table
+    if ! ip route show table $TABLE_ID 2>/dev/null | grep -q "default via"; then
+      # Wait for the upstream device to reconnect and get a new gateway
+      NEW_GW=""
+      while [ -z "$NEW_GW" ]; do
+        sleep 2
+        NEW_GW=$(ip -4 route show dev $UPSTREAM_DEV | awk '/default/ {print $3}' | head -n 1)
+      done
+      NEW_SUBNET=$(ip -4 route show dev $UPSTREAM_DEV scope link | awk '{print $1}' | head -n 1)
+
+      # Flush and rebuild the PBR routing table
+      ip route flush table $TABLE_ID 2>/dev/null
+      ip rule del from $HOST_IP/24 table $TABLE_ID prio 1000 2>/dev/null
+      
+      ip rule add from $HOST_IP/24 table $TABLE_ID prio 1000
+      ip route add $NEW_SUBNET dev $UPSTREAM_DEV scope link table $TABLE_ID
+      ip route add $SUBNET_PREFIX.0/24 dev $DOWNSTREAM_DEV scope link table $TABLE_ID
+      ip route add default via $NEW_GW dev $UPSTREAM_DEV table $TABLE_ID
+    fi
+  done
+) &
+DAEMON_PID=$!
 
 tcpdump -i any "icmp or (udp and (port 67 or port 68))" -n || error "Failed to start tcpdump monitoring"
